@@ -8,7 +8,6 @@ from dynaconf import base
 import polars as pl
 import blazestore as bs
 import datacenter as dc
-import xcals
 from xcals import api
 from datetime import date
 import numpy as np  
@@ -26,7 +25,7 @@ plt.rcParams["axes.unicode_minus"] = False
 
 
 
-class fundamental_factor:
+class DailyPriceVolume_factor:
 
     #设置BlazeStore路径
     def __init__(self, blazestore_path: str):
@@ -134,6 +133,11 @@ class fundamental_factor:
         dfs = []
         for d in trade_dates:
             df = factor_func(d).collect()
+            factor_columns = [column for column in df.columns if column not in ("date", "asset")]
+            if factor_columns:
+                df = df.with_columns(
+                    pl.col(factor_columns).cast(pl.Float64)
+                )
             dfs.append(df)
             print(f"{d} done")
 
@@ -172,7 +176,7 @@ class fundamental_factor:
 
 
     def calc_ret_nd(self, date: str, n: int = 1) -> pl.LazyFrame:
-        factor_name = f"ret_{n}d"
+        factor_name = f"DailyPriceVolume_ret_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -192,7 +196,17 @@ class fundamental_factor:
                 pl.col("close").cast(pl.Float64).shift(n).over("asset").alias("close_n")
             )
             .with_columns(
-                (pl.col("close") / pl.col("close_n") - 1).alias(factor_name)
+                pl.when(
+                    pl.col("close_n").is_not_null()
+                    & (pl.col("close_n") != 0)
+                )
+                .then(
+                    pl.col("close").cast(pl.Float64)
+                    / pl.col("close_n").cast(pl.Float64)
+                    - 1.0
+                )
+                .otherwise(0.0)
+                .alias(factor_name)
             )
             .filter(
                 pl.col("date") == pl.lit(end_date).str.to_date()
@@ -209,7 +223,7 @@ class fundamental_factor:
         self,
         date: str,
         n: int = 1,
-        index_asset: str = "000300",
+        index_asset: str = "000001",
     ) -> pl.LazyFrame:
         '''
         计算过去 n 个交易日的个股超额收益率。
@@ -223,17 +237,30 @@ class fundamental_factor:
         n : int
             回看交易日数量。
         index_asset : str
-            指数代码，默认使用沪深 300 的 "000300"。
+            指数代码，默认使用上证综合指数的 "000001"。
 
         返回
         ----
         pl.LazyFrame
             包含 date、asset 和 exret_{index_asset}_{n}d 三列的 LazyFrame。
         '''
-        factor_name = f"exret_{index_asset}_{n}d"
+        factor_name = f"DailyPriceVolume_exret_{index_asset}_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
-            return pl.scan_parquet(factor_path)
+            cached_lf = pl.scan_parquet(factor_path)
+            has_duplicate_keys = (
+                cached_lf
+                .select(
+                    pl.struct(["date", "asset"])
+                    .is_duplicated()
+                    .any()
+                    .alias("has_duplicates")
+                )
+                .collect()
+                .item()
+            )
+            if not has_duplicate_keys:
+                return cached_lf
 
         end_date = date
         start_date = api.shift_tradeday(end_date, -n)
@@ -257,11 +284,17 @@ class fundamental_factor:
                 .alias("stock_close_n")
             )
             .with_columns(
-                (
+                pl.when(
+                    pl.col("stock_close_n").is_not_null()
+                    & (pl.col("stock_close_n") != 0)
+                )
+                .then(
                     pl.col("stock_close")
                     / pl.col("stock_close_n")
-                    - 1
-                ).alias("stock_ret")
+                    - 1.0
+                )
+                .otherwise(0.0)
+                .alias("stock_ret")
             )
             .filter(
                 pl.col("date") == pl.lit(end_date).str.to_date()
@@ -276,22 +309,32 @@ class fundamental_factor:
                 datatype=dc.DataType.KLINE_DAY,
             )
             .filter(pl.col("asset") == index_asset)
-            .sort("date")
             .select(["date", "close"])
-            .with_columns(
-                pl.col("close").cast(pl.Float64).alias("index_close")
+            .group_by("date")
+            .agg(
+                pl.col("close")
+                .last()
+                .cast(pl.Float64)
+                .alias("index_close")
             )
+            .sort("date")
             .with_columns(
                 pl.col("index_close")
                 .shift(n)
                 .alias("index_close_n")
             )
             .with_columns(
-                (
+                pl.when(
+                    pl.col("index_close_n").is_not_null()
+                    & (pl.col("index_close_n") != 0)
+                )
+                .then(
                     pl.col("index_close")
                     / pl.col("index_close_n")
-                    - 1
-                ).alias("index_ret")
+                    - 1.0
+                )
+                .otherwise(0.0)
+                .alias("index_ret")
             )
             .filter(
                 pl.col("date") == pl.lit(end_date).str.to_date()
@@ -301,7 +344,12 @@ class fundamental_factor:
 
         lf = (
             stock_df
-            .join(index_df, on="date", how="left")
+            .join(
+                index_df,
+                on="date",
+                how="left",
+                validate="m:1",
+            )
             .with_columns(
                 (
                     pl.col("stock_ret")
@@ -319,7 +367,7 @@ class fundamental_factor:
 
 
     def calc_vol_nd(self, date: str, n: int=5) -> pl.LazyFrame:
-        factor_name = f"vol_{n}d"
+        factor_name = f"DailyPriceVolume_vol_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -347,7 +395,7 @@ class fundamental_factor:
                         - 1
                     )
                 )
-                .otherwise(None)
+                .otherwise(0.0)
                 .alias("day_ret")
             )
             .with_columns(
@@ -364,7 +412,7 @@ class fundamental_factor:
         return lf.lazy()
 
     def calc_volume_ratio_nd(self, date: str, n: int= 5) -> pl.LazyFrame:
-        factor_name = f"volume_ratio_{n}d"
+        factor_name = f"DailyPriceVolume_volume_ratio_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -387,7 +435,16 @@ class fundamental_factor:
                 pl.col("date") == pl.lit(end_date).str.to_date()
             )
             .with_columns(
-                (pl.col("volume") / pl.col("MA_volume")).alias(factor_name)
+                pl.when(
+                    pl.col("MA_volume").is_not_null()
+                    & (pl.col("MA_volume") != 0)
+                )
+                .then(
+                    pl.col("volume").cast(pl.Float64)
+                    / pl.col("MA_volume").cast(pl.Float64)
+                )
+                .otherwise(0.0)
+                .alias(factor_name)
             )
             .select(["date", "asset", factor_name])
             .sort(["asset", "date"])
@@ -399,7 +456,7 @@ class fundamental_factor:
 
     
     def calc_ocret_nd(self, date : str, n : int =1) -> pl.LazyFrame:
-        factor_name =f"ocret_{n}d"
+        factor_name = f"DailyPriceVolume_ocret_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -416,12 +473,16 @@ class fundamental_factor:
             .sort(['asset','date'])
             .select(['asset','date','close','open'])
             .with_columns(
-                (
-                    pl.col('close')
-                    /
-                    pl.col('open')
-                    -1
+                pl.when(
+                    pl.col('open').is_not_null()
+                    & (pl.col('open') != 0)
                 )
+                .then(
+                    pl.col('close').cast(pl.Float64)
+                    / pl.col('open').cast(pl.Float64)
+                    - 1.0
+                )
+                .otherwise(0.0)
                 .alias(factor_name)
             )
             .select(['asset','date',factor_name])
@@ -434,7 +495,7 @@ class fundamental_factor:
 
 
     def calc_gap_ret_nd(self, date: str, n : int =1) -> pl.LazyFrame:
-        factor_name = f"gap_ret_{n}d"
+        factor_name = f"DailyPriceVolume_gap_ret_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -449,9 +510,16 @@ class fundamental_factor:
             .sort(["asset", "date"])
             .select(["date", "asset", "open", "prev_close"])
             .with_columns(
-                (
-                    pl.col("open") / pl.col("prev_close") - 1
+                pl.when(
+                    pl.col("prev_close").is_not_null()
+                    & (pl.col("prev_close") != 0)
                 )
+                .then(
+                    pl.col("open").cast(pl.Float64)
+                    / pl.col("prev_close").cast(pl.Float64)
+                    - 1.0
+                )
+                .otherwise(0.0)
                 .alias(factor_name)
             )
             .select(["date", "asset", factor_name])
@@ -465,7 +533,7 @@ class fundamental_factor:
 
 
     def calc_hl_range_nd(self, date: str, n: int =1) -> pl.LazyFrame:
-        factor_name = f"hl_range_{n}d"
+        factor_name = f"DailyPriceVolume_hl_range_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -482,13 +550,18 @@ class fundamental_factor:
             .sort(["asset", "date"])
             .select(["date", "asset", "high", "low"])
             .with_columns(
-                (
-                    (
-                        pl.col("high") - pl.col("low")
-                    )
-                    /
-                    pl.col("low")
+                pl.when(
+                    pl.col("low").is_not_null()
+                    & (pl.col("low") != 0)
                 )
+                .then(
+                    (
+                        pl.col("high").cast(pl.Float64)
+                        - pl.col("low").cast(pl.Float64)
+                    )
+                    / pl.col("low").cast(pl.Float64)
+                )
+                .otherwise(0.0)
                 .alias(factor_name)
             )
             .select(["date", "asset", factor_name])
@@ -501,7 +574,7 @@ class fundamental_factor:
 
 
     def calc_close_position_nd(self, date: str, n : int =1) -> pl.LazyFrame:
-        factor_name = f"close_position_{n}d"
+        factor_name = f"DailyPriceVolume_close_position_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -550,7 +623,7 @@ class fundamental_factor:
 
 
     def calc_bias_nd(self, date: str, n: int = 5) -> pl.LazyFrame:
-        factor_name = f"bias_{n}d"
+        factor_name = f"DailyPriceVolume_bias_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -573,7 +646,17 @@ class fundamental_factor:
                 pl.col("date") == pl.lit(end_date).str.to_date()
             )
             .with_columns(
-                (pl.col("close") / pl.col("MA_close") - 1).alias(factor_name)
+                pl.when(
+                    pl.col("MA_close").is_not_null()
+                    & (pl.col("MA_close") != 0)
+                )
+                .then(
+                    pl.col("close").cast(pl.Float64)
+                    / pl.col("MA_close").cast(pl.Float64)
+                    - 1.0
+                )
+                .otherwise(0.0)
+                .alias(factor_name)
             )
             .select(["date", "asset", factor_name])
             .sort(["asset", "date"])
@@ -586,7 +669,7 @@ class fundamental_factor:
 
 
     def calc_ma_trend_n_m(self, date: str, n: int = 5, m: int = 20) -> pl.LazyFrame:
-        factor_name = f"ma_trend_{n}_{m}d"
+        factor_name = f"DailyPriceVolume_ma_trend_{n}_{m}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)
@@ -609,7 +692,17 @@ class fundamental_factor:
                 pl.col("date") == pl.lit(end_date).str.to_date()
             )
             .with_columns(
-                (pl.col("close") / pl.col("MA_close") - 1).alias(factor_name)
+                pl.when(
+                    pl.col("MA_close").is_not_null()
+                    & (pl.col("MA_close") != 0)
+                )
+                .then(
+                    pl.col("close").cast(pl.Float64)
+                    / pl.col("MA_close").cast(pl.Float64)
+                    - 1.0
+                )
+                .otherwise(0.0)
+                .alias(factor_name)
             )
             .select(["date", "asset", factor_name])
             .sort(["asset", "date"])
@@ -621,7 +714,7 @@ class fundamental_factor:
 
 
     def calc_price_position_nd(self, date: str, n: int = 5) -> pl.LazyFrame:
-        factor_name = f"price_position_{n}d"
+        factor_name = f"DailyPriceVolume_price_position_{n}d"
         factor_path = self.get_factor_path(factor_name, date)
         if factor_path.exists():
             return pl.scan_parquet(factor_path)

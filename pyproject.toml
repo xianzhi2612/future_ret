@@ -7,4 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "alpha-lab>=0.2.0",
     "ipykernel>=7.3.0",
+    "scikit-learn>=1.9.1",
+    "tensorflow>=2.21.0",
 ]
