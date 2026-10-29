@@ -9,6 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-src/Amihud_factor.py
-src/Liquid_factor.py
+# src/Amihud_factor.py
+# src/Liquid_factor.py
 src/test.ipynb
